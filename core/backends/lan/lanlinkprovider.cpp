@@ -55,6 +55,7 @@ LanLinkProvider::LanLinkProvider(bool testMode, bool isDisabled)
     , m_testMode(testMode)
     , m_combineNetworkChangeTimer(this)
     , m_disabled(isDisabled)
+    , m_directConnectTimer(this)
 {
 #if defined(Q_OS_WIN) || defined(Q_OS_MAC)
     // TODO: Both Windows and macOS have system APIs for mDNS that we could use.
@@ -84,6 +85,10 @@ LanLinkProvider::LanLinkProvider(bool testMode, bool isDisabled)
     connect(&m_udpSocket, &QAbstractSocket::errorOccurred, nullptr, [](QAbstractSocket::SocketError socketError) {
         qWarning() << "Error sending UDP packet:" << socketError;
     });
+
+    m_directConnectTimer.setInterval(DIRECT_CONNECT_INTERVAL_MS);
+    m_directConnectTimer.setSingleShot(false);
+    connect(&m_directConnectTimer, &QTimer::timeout, this, &LanLinkProvider::directConnectTimeout);
 
     const auto checkNetworkChange = [this]() {
         if (QNetworkInformation::instance()->reachability() == QNetworkInformation::Reachability::Online) {
@@ -150,6 +155,9 @@ void LanLinkProvider::onStart()
 
     m_mdnsDiscovery->onStart();
 
+    directConnectToDevices();
+    m_directConnectTimer.start();
+
     qCDebug(KDECONNECT_CORE) << "LanLinkProvider started";
 }
 
@@ -158,6 +166,12 @@ void LanLinkProvider::onStop()
     if (m_disabled) {
         return;
     }
+    m_directConnectTimer.stop();
+    for (auto it = m_pendingDirectConnections.begin(); it != m_pendingDirectConnections.end(); ++it) {
+        it.value()->abort();
+        it.value()->deleteLater();
+    }
+    m_pendingDirectConnections.clear();
     m_mdnsDiscovery->onStop();
     m_udpSocket.close();
     m_server->close();
@@ -191,6 +205,7 @@ void LanLinkProvider::debouncedOnNetworkChange()
 
     broadcastUdpIdentityPacket();
     m_mdnsDiscovery->onNetworkChange();
+    directConnectToDevices();
 }
 
 void LanLinkProvider::broadcastUdpIdentityPacket()
@@ -211,15 +226,13 @@ QList<QHostAddress> LanLinkProvider::getBroadcastAddresses()
     QList<QHostAddress> destinations;
     destinations.reserve(customDevices.length() + 1);
 
-    // Default broadcast address
     destinations.append(m_testMode ? QHostAddress::LocalHost : QHostAddress::Broadcast);
 
-    // Custom device addresses
-    for (auto &customDevice : customDevices) {
-        QHostAddress address(customDevice);
-        if (address.isNull()) {
-            qCWarning(KDECONNECT_CORE) << "Invalid custom device address" << customDevice;
-        } else {
+    // Add custom device IPs as unicast UDP targets; hostnames are handled via direct TCP
+    for (const auto &customDevice : customDevices) {
+        QStringList hostPort = parseCustomDeviceHost(customDevice);
+        QHostAddress address(hostPort[0]);
+        if (!address.isNull()) {
             destinations.append(address);
         }
     }
@@ -229,7 +242,6 @@ QList<QHostAddress> LanLinkProvider::getBroadcastAddresses()
 
 void LanLinkProvider::sendUdpIdentityPacket(const QList<QHostAddress> &addresses)
 {
-    // Broadcast from every local IP address to reach all networks
     QUdpSocket sendSocket;
     sendSocket.setProxy(QNetworkProxy::NoProxy);
     for (const QNetworkInterface &iface : QNetworkInterface::allInterfaces()) {
@@ -237,7 +249,7 @@ void LanLinkProvider::sendUdpIdentityPacket(const QList<QHostAddress> &addresses
             for (const QNetworkAddressEntry &ifaceAddress : iface.addressEntries()) {
                 QHostAddress sourceAddress = ifaceAddress.ip();
                 if (sourceAddress.protocol() == QAbstractSocket::IPv4Protocol && sourceAddress != QHostAddress::LocalHost) {
-                    qCDebug(KDECONNECT_CORE) << "Broadcasting as" << sourceAddress;
+                    qCDebug(KDECONNECT_CORE) << "Broadcasting as" << sourceAddress << "on" << iface.name();
                     sendSocket.bind(sourceAddress);
                     sendUdpIdentityPacket(sendSocket, addresses);
                     sendSocket.close();
@@ -252,15 +264,15 @@ void LanLinkProvider::sendUdpIdentityPacket(QUdpSocket &socket, const QList<QHos
     DeviceInfo myDeviceInfo = KdeConnectConfig::instance().deviceInfo();
     NetworkPacket identityPacket = myDeviceInfo.toIdentityPacket();
     identityPacket.set(QStringLiteral("tcpPort"), m_tcpPort);
+
     const QByteArray payload = identityPacket.serialize();
 
     for (auto &address : addresses) {
         qint64 bytes = socket.writeDatagram(payload, address, UDP_PORT);
         if (bytes == -1 && socket.error() == QAbstractSocket::DatagramTooLargeError) {
             // On macOS and FreeBSD, UDP broadcasts larger than MTU get dropped. See:
-            // https://opensource.apple.com/source/xnu/xnu-3789.1.32/bsd/netinet/ip_output.c.auto.html#:~:text=/*%20don%27t%20allow%20broadcast%20messages%20to%20be%20fragmented%20*/
+            // https://opensource.apple.com/source/xnu/xnu-3789.1.32/bsd/netinet/ip_output.c.auto.html
             // We remove the capabilities to reduce the size of the packet.
-            // This should only happen for broadcasts, so UDP packets sent from MDNS discoveries should still work.
             qWarning() << "Identity packet to" << address << "got rejected because it was too large. Retrying without including the capabilities";
             identityPacket.set(QStringLiteral("outgoingCapabilities"), QStringList());
             identityPacket.set(QStringLiteral("incomingCapabilities"), QStringList());
@@ -346,6 +358,8 @@ void LanLinkProvider::connectError(QSslSocket *socket, QHostAddress sender, QAbs
     qCDebug(KDECONNECT_CORE) << "Fallback (1), try reverse connection (send udp packet)" << socket->errorString();
     NetworkPacket np = KdeConnectConfig::instance().deviceInfo().toIdentityPacket();
     np.set(QStringLiteral("tcpPort"), m_tcpPort);
+    np.set(QStringLiteral("outgoingCapabilities"), QStringList());
+    np.set(QStringLiteral("incomingCapabilities"), QStringList());
     m_udpSocket.writeDatagram(np.serialize(), sender, UDP_PORT);
 
     // The socket we created didn't work, and we didn't manage
@@ -393,6 +407,8 @@ void LanLinkProvider::tcpSocketConnected(QSslSocket *socket, std::shared_ptr<Net
         // The socket doesn't seem to work, so we can't create the connection.
 
         qCDebug(KDECONNECT_CORE) << "Fallback (2), try reverse connection (send udp packet)";
+        np2.set(QStringLiteral("outgoingCapabilities"), QStringList());
+        np2.set(QStringLiteral("incomingCapabilities"), QStringList());
         m_udpSocket.writeDatagram(np2.serialize(), sender, UDP_PORT);
 
         // Disconnect should trigger deleteLater
@@ -584,6 +600,14 @@ void LanLinkProvider::onLinkDestroyed(const QString &deviceId, DeviceLink *oldPt
     qCDebug(KDECONNECT_CORE) << "LanLinkProvider deviceLinkDestroyed" << deviceId;
     DeviceLink *link = m_links.take(deviceId);
     Q_ASSERT(link == oldPtr);
+
+    if (KdeConnectConfig::instance().trustedDevices().contains(deviceId)) {
+        qCDebug(KDECONNECT_CORE) << "Trusted device link lost, scheduling reconnection for" << deviceId;
+        broadcastUdpIdentityPacket();
+        QTimer::singleShot(DIRECT_CONNECT_RETRY_DELAY_MS, this, [this]() {
+            directConnectToDevices();
+        });
+    }
 }
 
 void LanLinkProvider::configureSslSocket(QSslSocket *socket, const QString &deviceId, bool isDeviceTrusted)
@@ -617,21 +641,33 @@ void LanLinkProvider::configureSocket(QSslSocket *socket)
     socket->setProxy(QNetworkProxy::NoProxy);
     socket->setSocketOption(QAbstractSocket::KeepAliveOption, QVariant(1));
 
-#ifdef TCP_KEEPIDLE
-    // Detect dead connections in ~60s instead of the Linux default ~7875s.
-    // Without this, a phone that silently disappears (e.g. WiFi off) leaves a
-    // stale connection where isReachable() remains true and sends fail without
-    // any user-visible error (BUG 476747).
     int fd = socket->socketDescriptor();
     if (fd >= 0) {
+#ifdef TCP_KEEPIDLE
+        // Linux: Detect dead connections in ~60s instead of the default ~7875s.
+        // Without this, a phone that silently disappears (e.g. WiFi off) leaves a
+        // stale connection where isReachable() remains true and sends fail without
+        // any user-visible error (BUG 476747).
         int idle = 30; // seconds before first keepalive probe
         int intvl = 10; // seconds between probes
         int cnt = 3; // failed probes before connection is dropped
         setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
         setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
         setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
-    }
+#elif defined(Q_OS_MAC)
+// macOS: TCP_KEEPALIVE is the equivalent of Linux's TCP_KEEPIDLE
+// TCP_KEEPINTVL and TCP_KEEPCNT are available on macOS 10.8+
+#ifndef TCP_KEEPALIVE
+#define TCP_KEEPALIVE 0x10
 #endif
+        int idle = 30;
+        int intvl = 10;
+        int cnt = 3;
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+    }
 }
 
 void LanLinkProvider::addLink(QSslSocket *socket, const DeviceInfo &deviceInfo)
@@ -672,6 +708,262 @@ void LanLinkProvider::addLink(QSslSocket *socket, const DeviceInfo &deviceInfo)
         m_links[deviceInfo.id] = deviceLink;
     }
     Q_EMIT onConnectionReceived(deviceLink);
+}
+
+QStringList LanLinkProvider::parseCustomDeviceHost(const QString &entry) const
+{
+    QString host = entry;
+    QString port = QString::number(MIN_TCP_PORT);
+
+    if (host.startsWith(QLatin1Char('['))) {
+        int closingBracket = host.indexOf(QLatin1Char(']'));
+        if (closingBracket >= 0) {
+            if (closingBracket + 1 < host.size() && host[closingBracket + 1] == QLatin1Char(':')) {
+                port = host.mid(closingBracket + 2);
+            }
+            host = host.mid(1, closingBracket - 1);
+        }
+    } else {
+        int lastColon = host.lastIndexOf(QLatin1Char(':'));
+        if (lastColon >= 0) {
+            QString possiblePort = host.mid(lastColon + 1);
+            bool ok;
+            int portNum = possiblePort.toInt(&ok);
+            if (ok && portNum >= MIN_TCP_PORT && portNum <= MAX_TCP_PORT) {
+                host = host.left(lastColon);
+                port = possiblePort;
+            }
+        }
+    }
+    return {host, port};
+}
+
+void LanLinkProvider::directConnectTimeout()
+{
+    broadcastUdpIdentityPacket();
+    directConnectToDevices();
+}
+
+void LanLinkProvider::directConnectToDevices()
+{
+    if (m_disabled || m_tcpPort == 0) {
+        return;
+    }
+
+    const QStringList customDevices = KdeConnectConfig::instance().customDevices();
+    if (customDevices.isEmpty()) {
+        return;
+    }
+
+    qCDebug(KDECONNECT_CORE) << "Attempting direct connections to custom devices";
+
+    for (const QString &entry : customDevices) {
+        QStringList hostPort = parseCustomDeviceHost(entry);
+        QString host = hostPort[0];
+        quint16 port = hostPort[1].toUShort();
+
+        // Check if it's a plain IP address
+        QHostAddress address(host);
+        if (!address.isNull()) {
+            directConnectToHost(address, port);
+        } else {
+            // It's a hostname — resolve asynchronously
+            QString key = host + QLatin1Char(':') + QString::number(port);
+            if (m_resolvingHosts.contains(key)) {
+                continue; // Already resolving this host
+            }
+            m_resolvingHosts.insert(key);
+            QHostInfo::lookupHost(host, this, [this, key, port](const QHostInfo &hostInfo) {
+                m_resolvingHosts.remove(key);
+                directHostResolved(hostInfo, port);
+            });
+        }
+    }
+}
+
+void LanLinkProvider::directHostResolved(const QHostInfo &hostInfo, quint16 port)
+{
+    if (hostInfo.error() != QHostInfo::NoError) {
+        qCDebug(KDECONNECT_CORE) << "Could not resolve custom device host:" << hostInfo.hostName() << "-" << hostInfo.errorString();
+        return;
+    }
+
+    if (hostInfo.addresses().isEmpty()) {
+        qCDebug(KDECONNECT_CORE) << "No addresses found for custom device host:" << hostInfo.hostName();
+        return;
+    }
+
+    const QHostAddress address = hostInfo.addresses().constFirst();
+    qCDebug(KDECONNECT_CORE) << "Resolved custom device host" << hostInfo.hostName() << "to" << address;
+
+    directConnectToHost(address, port);
+}
+
+void LanLinkProvider::directConnectToHost(const QHostAddress &address, quint16 port)
+{
+    if (address.isLoopback() && !m_testMode) {
+        return;
+    }
+
+    for (auto it = m_links.constBegin(); it != m_links.constEnd(); ++it) {
+        if (it.value()->hostAddress() == address) {
+            return;
+        }
+    }
+
+    QString addrKey = address.toString() + QLatin1Char(':') + QString::number(port);
+    if (m_pendingDirectConnections.contains(addrKey)) {
+        return;
+    }
+
+    qCDebug(KDECONNECT_CORE) << "Direct TCP connect to" << address << ":" << port;
+
+    QSslSocket *socket = new QSslSocket(this);
+    socket->setProxy(QNetworkProxy::NoProxy);
+
+    m_pendingDirectConnections.insert(addrKey, socket);
+
+    QTimer *timeoutTimer = new QTimer(socket);
+    timeoutTimer->setSingleShot(true);
+    timeoutTimer->setInterval(10000); // 10 seconds
+
+    connect(socket, &QAbstractSocket::connected, this, [this, socket, addrKey, timeoutTimer]() {
+        timeoutTimer->stop();
+        m_pendingDirectConnections.remove(addrKey);
+        directTcpConnected(socket);
+    });
+
+    connect(socket, &QAbstractSocket::errorOccurred, this, [this, socket, addrKey, timeoutTimer](QAbstractSocket::SocketError) {
+        timeoutTimer->stop();
+        m_pendingDirectConnections.remove(addrKey);
+        directTcpError(socket->error());
+        socket->deleteLater();
+    });
+
+    connect(timeoutTimer, &QTimer::timeout, socket, [socket]() {
+        socket->abort();
+    });
+    timeoutTimer->start();
+
+    socket->connectToHost(address, port);
+}
+
+void LanLinkProvider::directTcpConnected(QSslSocket *socket)
+{
+    qCDebug(KDECONNECT_CORE) << "Direct TCP connected to" << socket->peerAddress();
+
+    disconnect(socket, &QAbstractSocket::errorOccurred, this, nullptr);
+    configureSocket(socket);
+
+    connect(socket, &QAbstractSocket::disconnected, socket, &QObject::deleteLater);
+
+    // Send identity to the remote's TCP server, same as the UDP-initiated flow
+    NetworkPacket identityPacket = KdeConnectConfig::instance().deviceInfo().toIdentityPacket();
+    identityPacket.set(QStringLiteral("tcpPort"), m_tcpPort);
+    socket->write(identityPacket.serialize());
+    bool success = socket->waitForBytesWritten();
+
+    if (!success) {
+        qCDebug(KDECONNECT_CORE) << "Direct connect: failed to write identity to" << socket->peerAddress();
+        socket->abort();
+        return;
+    }
+    QSslConfiguration sslConfig;
+    sslConfig.setLocalCertificate(KdeConnectConfig::instance().certificate());
+    sslConfig.setPrivateKey(KdeConnectConfig::instance().privateKey());
+    sslConfig.setPeerVerifyMode(QSslSocket::QueryPeer);
+    socket->setSslConfiguration(sslConfig);
+
+    connect(socket, &QSslSocket::encrypted, this, [this, socket]() {
+        qCDebug(KDECONNECT_CORE) << "Direct connect: SSL completed with" << socket->peerAddress();
+
+        QString certDeviceId = socket->peerCertificate().subjectDisplayName();
+        DBusHelper::filterNonExportableCharacters(certDeviceId);
+
+        if (certDeviceId.isEmpty()) {
+            qCWarning(KDECONNECT_CORE) << "Direct connect: peer certificate has no device ID";
+            socket->abort();
+            return;
+        }
+
+        if (certDeviceId == KdeConnectConfig::instance().deviceId()) {
+            qCDebug(KDECONNECT_CORE) << "Direct connect: connected to ourselves, ignoring";
+            socket->abort();
+            return;
+        }
+
+        bool isDeviceTrusted = KdeConnectConfig::instance().trustedDevices().contains(certDeviceId);
+
+        NetworkPacket myIdentity = KdeConnectConfig::instance().deviceInfo().toIdentityPacket();
+        socket->write(myIdentity.serialize());
+        socket->flush();
+
+        QTimer *identityTimer = new QTimer(socket);
+        identityTimer->setSingleShot(true);
+        identityTimer->setInterval(5000);
+
+        connect(socket, &QIODevice::readyRead, this, [this, socket, certDeviceId, isDeviceTrusted, identityTimer]() {
+            if (socket->bytesAvailable() > MAX_IDENTITY_PACKET_SIZE) {
+                identityTimer->stop();
+                identityTimer->deleteLater();
+                qCWarning(KDECONNECT_CORE) << "Direct connect: too much data from" << socket->peerAddress();
+                socket->abort();
+                return;
+            }
+
+            if (!socket->canReadLine()) {
+                return; // Partial data, wait for more
+            }
+
+            identityTimer->stop();
+            identityTimer->deleteLater();
+
+            disconnect(socket, &QIODevice::readyRead, this, nullptr);
+
+            QByteArray identityString = socket->readLine();
+            NetworkPacket secureIdentityPacket;
+            bool success = NetworkPacket::unserialize(identityString, &secureIdentityPacket);
+
+            if (!success || !DeviceInfo::isValidIdentityPacket(&secureIdentityPacket)) {
+                qCWarning(KDECONNECT_CORE) << "Direct connect: invalid secure identity from" << certDeviceId;
+                socket->abort();
+                return;
+            }
+
+            QString secureDeviceId = secureIdentityPacket.get<QString>(QStringLiteral("deviceId"));
+            if (secureDeviceId != certDeviceId) {
+                qCWarning(KDECONNECT_CORE) << "Direct connect: device ID mismatch:" << secureDeviceId << "vs" << certDeviceId;
+                socket->abort();
+                return;
+            }
+
+            int protocolVersion = secureIdentityPacket.get<int>(QStringLiteral("protocolVersion"), 0);
+            if (isDeviceTrusted && isProtocolDowngrade(certDeviceId, protocolVersion)) {
+                qCWarning(KDECONNECT_CORE) << "Direct connect: protocol downgrade from" << certDeviceId;
+                socket->abort();
+                return;
+            }
+
+            DeviceInfo deviceInfo = DeviceInfo::FromIdentityPacketAndCert(secureIdentityPacket, socket->peerCertificate());
+            addLink(socket, deviceInfo);
+        });
+
+        connect(identityTimer, &QTimer::timeout, socket, [socket]() {
+            qCWarning(KDECONNECT_CORE) << "Direct connect: timed out waiting for secure identity from" << socket->peerAddress();
+            socket->abort();
+        });
+
+        identityTimer->start();
+    });
+
+    connect(socket, &QSslSocket::sslErrors, this, &LanLinkProvider::sslErrors);
+
+    socket->startServerEncryption();
+}
+
+void LanLinkProvider::directTcpError(QAbstractSocket::SocketError socketError)
+{
+    qCDebug(KDECONNECT_CORE) << "Direct connect error:" << socketError;
 }
 
 #include "moc_lanlinkprovider.cpp"
