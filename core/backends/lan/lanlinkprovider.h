@@ -9,6 +9,7 @@
 
 #include <memory>
 
+#include <QHostInfo>
 #include <QNetworkInformation>
 #include <QObject>
 #include <QSslSocket>
@@ -83,6 +84,10 @@ private Q_SLOTS:
     void tcpPacketReceived();
     void sslErrors(const QList<QSslError> &errors);
     void debouncedOnNetworkChange();
+    void directConnectTimeout();
+    void directHostResolved(const QHostInfo &hostInfo, quint16 port);
+    void directTcpConnected(QSslSocket *socket);
+    void directTcpError(QAbstractSocket::SocketError socketError);
 
 private:
     void addLink(QSslSocket *socket, const DeviceInfo &deviceInfo);
@@ -90,6 +95,9 @@ private:
     void sendUdpIdentityPacket(QUdpSocket &socket, const QList<QHostAddress> &addresses);
     void broadcastUdpIdentityPacket();
     bool isProtocolDowngrade(const QString &deviceId, int protocolVersion) const;
+    void directConnectToDevices();
+    void directConnectToHost(const QHostAddress &address, quint16 port);
+    QStringList parseCustomDeviceHost(const QString &entry) const;
 
     Server *m_server;
     QUdpSocket m_udpSocket;
@@ -104,6 +112,12 @@ private:
     bool m_disabled;
 
     MdnsDiscovery *m_mdnsDiscovery = nullptr;
+
+    QTimer m_directConnectTimer;
+    QMap<QString, QSslSocket *> m_pendingDirectConnections;
+    QSet<QString> m_resolvingHosts;
+    static const int DIRECT_CONNECT_INTERVAL_MS = 10000;
+    static const int DIRECT_CONNECT_RETRY_DELAY_MS = 5000;
 };
 
 #endif
