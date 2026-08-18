@@ -1,0 +1,7 @@
+# makepkg build artifacts
+src/
+pkg/
+kdeconnect-src/
+*.pkg.tar.zst
+*.pkg.tar.zst.sig
+*.log
