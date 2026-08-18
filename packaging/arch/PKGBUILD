@@ -1,0 +1,88 @@
+# Maintainer: WACOMalt
+# Adapted from the official Arch Linux kdeconnect PKGBUILD
+# (Maintainer: Antonio Rojas <arojas@archlinux.org>)
+#
+# Builds the WACOMalt fork of KDE Connect (direct TCP connections for
+# custom devices / Tailscale support) from the local git checkout.
+#
+# Usage: cd packaging/arch && makepkg -si
+
+pkgname=kdeconnect
+pkgver=26.11.70.r5576.g4de94b48b
+pkgrel=1
+pkgdesc='Adds communication between KDE and your smartphone (WACOMalt fork: direct IP / Tailscale support)'
+url='https://github.com/WACOMalt/kdeconnect-kde'
+arch=(x86_64)
+license=(GPL-2.0-or-later)
+depends=(dbus
+         glib2
+         glibc
+         kconfig
+         kcoreaddons
+         kcrash
+         kdbusaddons
+         kdeclarative
+         kguiaddons
+         ki18n
+         kio
+         kirigami
+         kirigami-addons
+         kitemmodels
+         kjobwidgets
+         knotifications
+         kpeople
+         kservice
+         kstatusnotifieritem
+         kwindowsystem
+         libei
+         libevdev
+         libfakekey
+         libstdc++
+         libx11
+         libxkbcommon
+         libxtst
+         modemmanager-qt
+         openssl
+         pulseaudio-qt
+         qqc2-desktop-style
+         qt6-base
+         qt6-connectivity
+         qt6-declarative
+         qt6-multimedia
+         solid
+         wayland)
+makedepends=(extra-cmake-modules
+             git
+             kpackage # kpackage_install_package
+             wayland-protocols)
+optdepends=('python-nautilus: Nautilus integration'
+            'qt6-tools: for some runcommand plugin actions'
+            'sshfs: remote filesystem browser')
+groups=(kde-applications
+        kde-network)
+
+# Clone from the local repository (two levels up from this PKGBUILD)
+_repodir=$(realpath "${PWD}/../..")
+_branch=tailscale-fix
+source=("kdeconnect-src::git+file://${_repodir}#branch=${_branch}")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd kdeconnect-src
+  local _major _minor _micro
+  _major=$(sed -n 's/^set (RELEASE_SERVICE_VERSION_MAJOR "\(.*\)")/\1/p' CMakeLists.txt)
+  _minor=$(sed -n 's/^set (RELEASE_SERVICE_VERSION_MINOR "\(.*\)")/\1/p' CMakeLists.txt)
+  _micro=$(sed -n 's/^set (RELEASE_SERVICE_VERSION_MICRO "\(.*\)")/\1/p' CMakeLists.txt)
+  printf '%s.%s.%s.r%s.g%s' "${_major}" "${_minor}" "${_micro}" \
+    "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cmake -B build -S kdeconnect-src \
+    -DBUILD_TESTING=OFF
+  cmake --build build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+}
